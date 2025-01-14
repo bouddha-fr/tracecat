@@ -1,6 +1,6 @@
 type: action
 definition:
-  name: active-response
+  name: wazuh_active_response
   namespace: integrations.wazuh
   title: Agents Active Response
   description: Run an Active Response command on all agents or a list of them
