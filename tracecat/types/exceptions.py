@@ -21,7 +21,7 @@ class TracecatException(Exception):
 
 
 class TracecatValidationError(TracecatException):
-    """Tracecat user-facting validation error"""
+    """Tracecat user-facing validation error"""
 
 
 class TracecatDSLError(TracecatValidationError):
@@ -82,8 +82,8 @@ class TaskUnreachable(TracecatException):
     """Raised when a task is unreachable."""
 
 
-class ActionExecutionError(TracecatException):
-    """Exception raised when an action execution error occurs."""
+class ExecutorClientError(TracecatException):
+    """Exception raised when an error occurs in the executor client."""
 
 
 class WrappedExecutionError(TracecatException):
@@ -92,3 +92,7 @@ class WrappedExecutionError(TracecatException):
 
     def __init__(self, error: Any):
         self.error = error
+
+
+class TracecatSettingsError(TracecatException):
+    """Exception raised when a setting error occurs."""

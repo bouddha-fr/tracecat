@@ -1,10 +1,15 @@
+import yaml
 from fastapi import APIRouter, HTTPException, status
+from pydantic_core import PydanticUndefined
 from sqlalchemy.exc import NoResultFound
 from sqlmodel import select
 
 from tracecat.auth.dependencies import WorkspaceUserRole
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.schemas import Action
+from tracecat.identifiers.action import ActionID
+from tracecat.identifiers.workflow import AnyWorkflowIDPath, WorkflowUUID
+from tracecat.registry.actions.service import RegistryActionsService
 from tracecat.workflow.actions.models import (
     ActionControlFlow,
     ActionCreate,
@@ -19,7 +24,7 @@ router = APIRouter(prefix="/actions")
 @router.get("", tags=["actions"])
 async def list_actions(
     role: WorkspaceUserRole,
-    workflow_id: str,
+    workflow_id: AnyWorkflowIDPath,
     session: AsyncDBSession,
 ) -> list[ActionReadMinimal]:
     """List all actions for a workflow."""
@@ -29,19 +34,18 @@ async def list_actions(
     )
     results = await session.exec(statement)
     actions = results.all()
-    action_metadata = [
+    response = [
         ActionReadMinimal(
             id=action.id,
-            workflow_id=workflow_id,
+            workflow_id=WorkflowUUID.new(action.workflow_id).short(),
             type=action.type,
             title=action.title,
             description=action.description,
             status=action.status,
-            key=action.key,
         )
         for action in actions
     ]
-    return action_metadata
+    return response
 
 
 @router.post("", tags=["actions"])
@@ -51,9 +55,13 @@ async def create_action(
     session: AsyncDBSession,
 ) -> ActionReadMinimal:
     """Create a new action for a workflow."""
+    if role.workspace_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace ID is required"
+        )
     action = Action(
         owner_id=role.workspace_id,
-        workflow_id=params.workflow_id,
+        workflow_id=WorkflowUUID.new(params.workflow_id),
         type=params.type,
         title=params.title,
         description="",  # Default to empty string
@@ -77,12 +85,11 @@ async def create_action(
 
     action_metadata = ActionReadMinimal(
         id=action.id,
-        workflow_id=params.workflow_id,
-        type=params.type,
+        workflow_id=WorkflowUUID.new(action.workflow_id).short(),
+        type=action.type,
         title=action.title,
         description=action.description,
         status=action.status,
-        key=action.key,
     )
     return action_metadata
 
@@ -90,8 +97,8 @@ async def create_action(
 @router.get("/{action_id}", tags=["actions"])
 async def get_action(
     role: WorkspaceUserRole,
-    action_id: str,
-    workflow_id: str,
+    action_id: ActionID,
+    workflow_id: AnyWorkflowIDPath,
     session: AsyncDBSession,
 ) -> ActionRead:
     """Get an action."""
@@ -108,6 +115,19 @@ async def get_action(
             status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found"
         ) from e
 
+    # Add default value for input if it's empty
+    if len(action.inputs) == 0:
+        # Lookup action type in the registry
+        ra_service = RegistryActionsService(session, role=role)
+        reg_action = await ra_service.load_action_impl(action.type)
+        # We want to construct a YAML string that contains the defaults
+        prefilled_inputs = "\n".join(
+            f"{field}: "
+            for field, field_info in reg_action.args_cls.model_fields.items()
+            if field_info.default is PydanticUndefined
+        )
+        action.inputs = prefilled_inputs
+
     return ActionRead(
         id=action.id,
         type=action.type,
@@ -115,7 +135,6 @@ async def get_action(
         description=action.description,
         status=action.status,
         inputs=action.inputs,
-        key=action.key,
         control_flow=ActionControlFlow(**action.control_flow),
     )
 
@@ -123,7 +142,7 @@ async def get_action(
 @router.post("/{action_id}", tags=["actions"])
 async def update_action(
     role: WorkspaceUserRole,
-    action_id: str,
+    action_id: ActionID,
     params: ActionUpdate,
     session: AsyncDBSession,
 ) -> ActionRead:
@@ -149,6 +168,14 @@ async def update_action(
         action.status = params.status
     if params.inputs is not None:
         action.inputs = params.inputs
+        # Validate that it's a valid YAML string
+        try:
+            yaml.safe_load(action.inputs)
+        except yaml.YAMLError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Action input contains invalid YAML",
+            ) from e
     if params.control_flow is not None:
         action.control_flow = params.control_flow.model_dump(mode="json")
 
@@ -163,14 +190,13 @@ async def update_action(
         description=action.description,
         status=action.status,
         inputs=action.inputs,
-        key=action.key,
     )
 
 
 @router.delete("/{action_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["actions"])
 async def delete_action(
     role: WorkspaceUserRole,
-    action_id: str,
+    action_id: ActionID,
     session: AsyncDBSession,
 ) -> None:
     """Delete an action."""

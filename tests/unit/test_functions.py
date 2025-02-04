@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -28,12 +29,14 @@ from tracecat.expressions.functions import (
     dict_keys,
     dict_lookup,
     dict_values,
+    difference,
     div,
     does_not_contain,
     endswith,
     extract_text_from_html,
     filter_,
     flatten,
+    format_datetime,
     format_string,
     from_timestamp,
     generate_uuid,
@@ -68,6 +71,7 @@ from tracecat.expressions.functions import (
     not_equal,
     not_null,
     or_,
+    parse_datetime,
     pow,
     prettify_json_str,
     regex_extract,
@@ -86,10 +90,11 @@ from tracecat.expressions.functions import (
     sum_,
     titleize,
     to_datetime,
-    to_timestamp_str,
+    to_timestamp,
     union,
     unset_timezone,
     uppercase,
+    url_encode,
     weeks_between,
     zip_iterables,
 )
@@ -195,17 +200,32 @@ def test_base64_invalid_input(invalid_input: str, decode_func) -> None:
 @pytest.mark.parametrize(
     "input_val,timezone,expected",
     [
-        (
-            1609459200,
-            "UTC",
-            datetime(2021, 1, 1, 0, 0, tzinfo=UTC),
-        ),  # UTC timestamp for 2021-01-01 00:00:00
+        (1609459200, "UTC", datetime(2021, 1, 1, 0, 0, tzinfo=UTC)),
         ("2021-01-01T00:00:00", None, datetime(2021, 1, 1, 0, 0)),
+        ("2021-01-01T00:00:00+00:00", None, datetime(2021, 1, 1, 0, 0, tzinfo=UTC)),
+        ("2021-01-01T00:00:00", "UTC", datetime(2021, 1, 1, 0, 0, tzinfo=UTC)),
+        ("2021-01-01", None, datetime(2021, 1, 1, 0, 0)),
         (datetime(2021, 1, 1, 0, 0), None, datetime(2021, 1, 1, 0, 0)),
+        ("2021-01-01T00:00:00Z", None, datetime(2021, 1, 1, 0, 0, tzinfo=UTC)),
+        ("2021-01-01T00:00:00Z", "UTC", datetime(2021, 1, 1, 0, 0, tzinfo=UTC)),
     ],
 )
-def test_to_datetime(input_val: Any, timezone: str, expected: datetime) -> None:
+def test_to_datetime(input_val: Any, timezone: str | None, expected: datetime) -> None:
     assert to_datetime(input_val, timezone) == expected
+
+
+@pytest.mark.parametrize(
+    "input",
+    [
+        # US mm/dd/yyyy format
+        "1/1/2021",
+        # ISO 8601 string with invalid date
+        "2021-02-31T00:00:00",
+    ],
+)
+def test_to_datetime_invalid_date_string(input: str) -> None:
+    with pytest.raises(ValueError):
+        to_datetime(input)
 
 
 @pytest.mark.parametrize(
@@ -443,6 +463,12 @@ def test_cast_operations() -> None:
 def test_build_lambda() -> None:
     add_one = _build_safe_lambda("lambda x: x + 1")
     assert add_one(1) == 2
+
+
+def test_use_jsonpath_in_safe_lambda():
+    data = {"name": "John"}
+    jsonpath = _build_safe_lambda("lambda x: jsonpath('$.name', x) == 'John'")
+    assert jsonpath(data) is True
 
 
 def test_build_lambda_catches_restricted_nodes() -> None:
@@ -745,9 +771,9 @@ def test_set_timezone(
     assert offset is not None
     offset_hours = offset.total_seconds() / 3600
     min_offset, max_offset = expected_range
-    assert (
-        min_offset <= offset_hours <= max_offset
-    ), f"Offset {offset_hours} not in expected range [{min_offset}, {max_offset}]"
+    assert min_offset <= offset_hours <= max_offset, (
+        f"Offset {offset_hours} not in expected range [{min_offset}, {max_offset}]"
+    )
 
 
 @pytest.mark.parametrize(
@@ -764,6 +790,17 @@ def test_unset_timezone(dt: datetime) -> None:
 @pytest.mark.parametrize(
     "input_str,expected",
     [
+        ("admin+tracecat1@gmail.com", "admin%2Btracecat1%40gmail.com"),
+        ("admin+tracecat1-org@gmail.com", "admin%2Btracecat1-org%40gmail.com"),
+    ],
+)
+def test_url_encode(input_str: str, expected: str) -> None:
+    assert url_encode(input_str) == expected
+
+
+@pytest.mark.parametrize(
+    "input_str,expected",
+    [
         ("Hello, World!", "SGVsbG8sIFdvcmxkIQ=="),
         ("", ""),
         ("Special chars: !@#$%^&*()", "U3BlY2lhbCBjaGFyczogIUAjJCVeJiooKQ=="),
@@ -774,22 +811,6 @@ def test_str_to_b64(input_str: str, expected: str) -> None:
     # Test URL-safe version
     url_result = str_to_b64url(input_str)
     assert b64url_to_str(url_result) == input_str
-
-
-@pytest.mark.parametrize(
-    "dt_input,expected_type",
-    [
-        (datetime(2024, 1, 1), float),
-        (datetime(2024, 12, 31, 23, 59, 59), float),
-    ],
-)
-def test_to_timestamp_str(dt_input: datetime, expected_type: type) -> None:
-    result = to_timestamp_str(dt_input)
-    assert isinstance(result, expected_type)
-    # Verify roundtrip
-    assert from_timestamp(int(result), "s").replace(microsecond=0) == dt_input.replace(
-        microsecond=0
-    )
 
 
 @pytest.mark.parametrize(
@@ -900,3 +921,144 @@ def test_create_range(start: int, end: int, step: int, expected: list[int]) -> N
     # Test invalid step
     with pytest.raises(ValueError):
         create_range(0, 5, 0)  # Step cannot be 0
+
+
+@pytest.mark.parametrize(
+    "a,b,expected",
+    [
+        ([1, 2, 3], [2, 3, 4], [1]),  # Basic difference
+        ([1, 2, 2], [2], [1]),  # Duplicates in first sequence
+        ([], [1, 2], []),  # Empty first sequence
+        ([1, 2], [], [1, 2]),  # Empty second sequence
+        (["a", "b"], ["b", "c"], ["a"]),  # String elements
+    ],
+)
+def test_difference(a: Sequence[Any], b: Sequence[Any], expected: list[Any]) -> None:
+    """Test set difference between two sequences."""
+    assert sorted(difference(a, b)) == sorted(expected)
+
+
+@pytest.mark.parametrize(
+    "input_val,unit,expected",
+    [
+        (
+            1609459200,
+            "s",
+            datetime(2021, 1, 1, 0, 0, tzinfo=UTC),
+        ),  # 2021-01-01 00:00:00
+        (
+            1609459200000,
+            "ms",
+            datetime(2021, 1, 1, 0, 0, tzinfo=UTC),
+        ),  # Same time in milliseconds
+        (
+            1672531200,
+            "s",
+            datetime(2023, 1, 1, 0, 0, tzinfo=UTC),
+        ),  # 2023-01-01 00:00:00
+        (
+            1672531200000,
+            "ms",
+            datetime(2023, 1, 1, 0, 0, tzinfo=UTC),
+        ),  # Same time in milliseconds
+    ],
+)
+def test_from_timestamp(input_val: int, unit: str, expected: datetime) -> None:
+    assert from_timestamp(input_val, unit) == expected
+
+
+@pytest.mark.parametrize(
+    "input_val,unit,expected",
+    [
+        (
+            datetime(2021, 1, 1, 0, 0, tzinfo=UTC),
+            "s",
+            1609459200,
+        ),  # 2021-01-01 00:00:00
+        (
+            datetime(2021, 1, 1, 0, 0, tzinfo=UTC),
+            "ms",
+            1609459200000,
+        ),  # Same time in milliseconds
+        (
+            datetime(2023, 1, 1, 0, 0, tzinfo=UTC),
+            "s",
+            1672531200,
+        ),  # 2023-01-01 00:00:00
+        (
+            datetime(2023, 1, 1, 0, 0, tzinfo=UTC),
+            "ms",
+            1672531200000,
+        ),  # Same time in milliseconds
+        ("2021-01-01T00:00:00", "s", 1609459200),  # String input
+        ("2023-01-01T00:00:00", "ms", 1672531200000),  # String input with ms
+    ],
+)
+def test_to_timestamp(input_val: datetime | str, unit: str, expected: int) -> None:
+    assert to_timestamp(input_val, unit) == expected
+
+
+@pytest.mark.parametrize(
+    "input_str,format_str,expected",
+    [
+        (
+            "2021-01-01 00:00:00",
+            "%Y-%m-%d %H:%M:%S",
+            datetime(2021, 1, 1, 0, 0, 0),
+        ),
+        (
+            "01/01/2021 15:30",
+            "%d/%m/%Y %H:%M",
+            datetime(2021, 1, 1, 15, 30),
+        ),
+        (
+            "2023-12-31",
+            "%Y-%m-%d",
+            datetime(2023, 12, 31),
+        ),
+    ],
+)
+def test_parse_datetime(input_str: str, format_str: str, expected: datetime) -> None:
+    assert parse_datetime(input_str, format_str) == expected
+
+    # Test invalid format
+    with pytest.raises(ValueError):
+        parse_datetime(input_str, "invalid_format")
+
+
+@pytest.mark.parametrize(
+    "input_val,format_str,expected",
+    [
+        (
+            datetime(2021, 1, 1, 0, 0),
+            "%Y-%m-%d %H:%M:%S",
+            "2021-01-01 00:00:00",
+        ),
+        (
+            datetime(2021, 1, 1, 15, 30),
+            "%d/%m/%Y %H:%M",
+            "01/01/2021 15:30",
+        ),
+        (
+            "2021-01-01T00:00:00",  # String input
+            "%Y-%m-%d",
+            "2021-01-01",
+        ),
+        # With timezone
+        (
+            datetime(2021, 1, 1, 0, 0, tzinfo=UTC),
+            "%Y-%m-%d %H:%M:%S",
+            "2021-01-01 00:00:00",
+        ),
+        # With timezone in ISO 8601 datetime string
+        (
+            "2021-01-01T00:00:00+00:00",
+            "%Y-%m-%d %H:%M:%S",
+            "2021-01-01 00:00:00",
+        ),
+    ],
+)
+def test_format_datetime(
+    input_val: datetime | str, format_str: str, expected: str
+) -> None:
+    assert format_datetime(input_val, format_str) == expected

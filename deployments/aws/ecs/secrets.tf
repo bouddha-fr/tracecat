@@ -34,11 +34,6 @@ data "aws_secretsmanager_secret" "oauth_client_secret" {
   arn   = var.oauth_client_secret_arn
 }
 
-data "aws_secretsmanager_secret" "saml_idp_certificate" {
-  count = var.saml_idp_certificate_arn != null ? 1 : 0
-  arn   = var.saml_idp_certificate_arn
-}
-
 data "aws_secretsmanager_secret" "saml_idp_metadata_url" {
   count = var.saml_idp_metadata_url_arn != null ? 1 : 0
   arn   = var.saml_idp_metadata_url_arn
@@ -82,11 +77,6 @@ data "aws_secretsmanager_secret_version" "oauth_client_secret" {
   secret_id = data.aws_secretsmanager_secret.oauth_client_secret[0].id
 }
 
-data "aws_secretsmanager_secret_version" "saml_idp_certificate" {
-  count     = var.saml_idp_certificate_arn != null ? 1 : 0
-  secret_id = data.aws_secretsmanager_secret.saml_idp_certificate[0].id
-}
-
 data "aws_secretsmanager_secret_version" "saml_idp_metadata_url" {
   count     = var.saml_idp_metadata_url_arn != null ? 1 : 0
   secret_id = data.aws_secretsmanager_secret.saml_idp_metadata_url[0].id
@@ -112,7 +102,8 @@ data "aws_secretsmanager_secret" "tracecat_db_password" {
 }
 
 data "aws_secretsmanager_secret" "temporal_db_password" {
-  arn        = aws_db_instance.temporal_database.master_user_secret[0].secret_arn
+  count      = var.disable_temporal_autosetup ? 0 : 1
+  arn        = aws_db_instance.temporal_database[0].master_user_secret[0].secret_arn
   depends_on = [aws_db_instance.temporal_database]
 }
 
@@ -121,7 +112,8 @@ data "aws_secretsmanager_secret_version" "tracecat_db_password" {
 }
 
 data "aws_secretsmanager_secret_version" "temporal_db_password" {
-  secret_id = data.aws_secretsmanager_secret.temporal_db_password.id
+  count     = var.disable_temporal_autosetup ? 0 : 1
+  secret_id = data.aws_secretsmanager_secret.temporal_db_password[0].id
 }
 
 locals {
@@ -154,13 +146,6 @@ locals {
     }
   ] : []
 
-  saml_idp_certificate_secret = var.saml_idp_certificate_arn != null ? [
-    {
-      name      = "SAML_IDP_CERTIFICATE"
-      valueFrom = data.aws_secretsmanager_secret_version.saml_idp_certificate[0].arn
-    }
-  ] : []
-
   saml_idp_metadata_url_secret = var.saml_idp_metadata_url_arn != null ? [
     {
       name      = "SAML_IDP_METADATA_URL"
@@ -186,14 +171,13 @@ locals {
     local.tracecat_base_secrets,
     local.oauth_client_id_secret,
     local.oauth_client_secret_secret,
-    local.saml_idp_certificate_secret,
     local.saml_idp_metadata_url_secret
   )
 
-  temporal_secrets = [
+  temporal_secrets = var.disable_temporal_autosetup ? [] : [
     {
       name      = "POSTGRES_PWD"
-      valueFrom = "${data.aws_secretsmanager_secret_version.temporal_db_password.arn}:password::"
+      valueFrom = "${data.aws_secretsmanager_secret_version.temporal_db_password[0].arn}:password::"
     }
   ]
 

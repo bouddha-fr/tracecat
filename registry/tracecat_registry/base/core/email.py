@@ -2,15 +2,18 @@
 # XXX(WARNING): Do not import __future__ annotations from typing
 # This will cause class types to be resolved as strings
 
+import json
 import re
 import smtplib
 import socket
 import ssl
+from copy import deepcopy
 from email.message import EmailMessage
 from typing import Annotated, Any, Literal
 
 import nh3
-from pydantic import Field
+from tracecat.config import TRACECAT__ALLOWED_EMAIL_ATTRIBUTES
+from typing_extensions import Doc
 
 from tracecat_registry import RegistrySecret, registry, secrets
 
@@ -36,7 +39,7 @@ def _build_email_message(
     recipients: list[str],
     subject: str,
     body: str,
-    content_type: Literal["text/plain", "text/html"] = "text/plain",
+    content_type: str,
     bcc: str | list[str] | None = None,
     cc: str | list[str] | None = None,
     reply_to: str | list[str] | None = None,
@@ -51,7 +54,15 @@ def _build_email_message(
         msg.add_alternative(
             "This email requires an HTML viewer to display properly.", subtype="plain"
         )
-        sanitized_body = nh3.clean(body)
+        if TRACECAT__ALLOWED_EMAIL_ATTRIBUTES:
+            ALLOWED_ATTRIBUTES = deepcopy(nh3.ALLOWED_ATTRIBUTES)
+            for tag, attributes in json.loads(
+                TRACECAT__ALLOWED_EMAIL_ATTRIBUTES
+            ).items():
+                ALLOWED_ATTRIBUTES[tag] = set(attributes)
+            sanitized_body = nh3.clean(body, attributes=ALLOWED_ATTRIBUTES)
+        else:
+            sanitized_body = nh3.clean(body)
         msg.add_alternative(sanitized_body, subtype="html")
     elif content_type == "text/plain":
         msg.set_content(body)
@@ -89,36 +100,51 @@ def _build_email_message(
     secrets=[smtp_secret],
 )
 def send_email_smtp(
-    sender: Annotated[str, Field(..., description="Email address of the sender")],
-    recipients: Annotated[
-        list[str], Field(..., description="List of recipient email addresses")
+    sender: Annotated[
+        str,
+        Doc("Email address of the sender"),
     ],
-    subject: Annotated[str, Field(..., description="Subject of the email")],
-    body: Annotated[str, Field(..., description="Body content of the email")],
+    recipients: Annotated[
+        list[str],
+        Doc("List of recipient email addresses"),
+    ],
+    subject: Annotated[
+        str,
+        Doc("Subject of the email"),
+    ],
+    body: Annotated[
+        str,
+        Doc("Body content of the email"),
+    ],
     content_type: Annotated[
         Literal["text/plain", "text/html"],
-        Field(
-            None,
-            description="Email content type ('text/plain' or 'text/html'). Defaults to 'text/plain'.",
+        Doc(
+            "Email content type ('text/plain' or 'text/html'). Defaults to 'text/plain'."
         ),
     ] = "text/plain",
     timeout: Annotated[
-        float | None, Field(None, description="Timeout for SMTP operations in seconds")
+        float | None,
+        Doc("Timeout for SMTP operations in seconds"),
     ] = None,
     headers: Annotated[
-        dict[str, str] | None, Field(None, description="Additional email headers")
+        dict[str, str] | None,
+        Doc("Additional email headers"),
     ] = None,
     enable_starttls: Annotated[
-        bool, Field(False, description="Enable STARTTLS for secure connection")
+        bool,
+        Doc("Enable STARTTLS for secure connection"),
     ] = False,
     enable_ssl: Annotated[
-        bool, Field(False, description="Enable SSL for secure connection")
+        bool,
+        Doc("Enable SSL for secure connection"),
     ] = False,
     enable_auth: Annotated[
-        bool, Field(False, description="Enable SMTP authentication")
+        bool,
+        Doc("Enable SMTP authentication"),
     ] = False,
     ignore_cert_errors: Annotated[
-        bool, Field(False, description="Ignore SSL certificate errors")
+        bool,
+        Doc("Ignore SSL certificate errors"),
     ] = False,
 ) -> dict[str, Any]:
     """Run a send email action.

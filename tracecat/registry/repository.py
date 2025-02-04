@@ -2,24 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import importlib.resources
 import inspect
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
-from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import Callable
 from itertools import chain
 from pathlib import Path
 from timeit import default_timer
 from types import ModuleType
-from typing import Annotated, Any, Literal, TypedDict, cast
-from urllib.parse import urlparse, urlunparse
+from typing import Annotated, Any, Literal, cast
 
-import paramiko
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -34,18 +28,22 @@ from typing_extensions import Doc
 
 from tracecat import config
 from tracecat.contexts import ctx_role
+from tracecat.db.engine import get_async_session_context_manager
 from tracecat.expressions.expectations import create_expectation_model
 from tracecat.expressions.validation import TemplateValidator
+from tracecat.git import GitUrl, get_git_repository_sha, parse_git_url
 from tracecat.logger import logger
+from tracecat.parse import safe_url
 from tracecat.registry.actions.models import BoundRegistryAction, TemplateAction
 from tracecat.registry.constants import (
     CUSTOM_REPOSITORY_ORIGIN,
+    DEFAULT_LOCAL_REGISTRY_ORIGIN,
     DEFAULT_REGISTRY_ORIGIN,
-    GITHUB_SSH_KEY_SECRET_NAME,
 )
 from tracecat.registry.repositories.models import RegistryRepositoryCreate
 from tracecat.registry.repositories.service import RegistryReposService
-from tracecat.secrets.service import SecretsService
+from tracecat.settings.service import get_setting
+from tracecat.ssh import SshEnv, ssh_context
 from tracecat.types.auth import Role
 from tracecat.types.exceptions import RegistryError
 
@@ -54,12 +52,15 @@ type F = Callable[..., Any]
 
 
 class RegisterKwargs(BaseModel):
-    default_title: str | None
-    display_group: str | None
     namespace: str
     description: str
-    secrets: list[RegistrySecret] | None
-    include_in_schema: bool
+    default_title: str | None = None
+    display_group: str | None = None
+    doc_url: str | None = None
+    author: str | None = None
+    deprecated: str | None = None
+    secrets: list[RegistrySecret] | None = None
+    include_in_schema: bool = True
 
 
 class Repository:
@@ -112,10 +113,6 @@ class Repository:
         """Retrieve a registered udf."""
         return self._store[name]
 
-    def safe_remote_url(self, remote_registry_url: str) -> str:
-        """Clean a remote registry url."""
-        return safe_url(remote_registry_url)
-
     def init(self, include_base: bool = True, include_templates: bool = True) -> None:
         """Initialize the registry."""
         if not self._is_initialized:
@@ -150,6 +147,9 @@ class Repository:
         rtype_adapter: TypeAdapter,
         default_title: str | None,
         display_group: str | None,
+        doc_url: str | None,
+        author: str | None,
+        deprecated: str | None,
         include_in_schema: bool,
         template_action: TemplateAction | None = None,
         origin: str = DEFAULT_REGISTRY_ORIGIN,
@@ -160,6 +160,9 @@ class Repository:
             namespace=namespace,
             description=description,
             type=type,
+            doc_url=doc_url,
+            author=author,
+            deprecated=deprecated,
             secrets=secrets,
             args_cls=args_cls,
             args_docs=args_docs,
@@ -172,7 +175,7 @@ class Repository:
             include_in_schema=include_in_schema,
         )
 
-        logger.debug(f"Registering UDF {reg_action.action=}")
+        logger.debug(f"Registering action {reg_action.action=}")
         self._store[reg_action.action] = reg_action
 
     def register_template_action(
@@ -190,6 +193,9 @@ class Repository:
             name=defn.name,
             namespace=defn.namespace,
             description=defn.description,
+            doc_url=defn.doc_url,
+            author=defn.author,
+            deprecated=defn.deprecated,
             secrets=defn.secrets,
             args_cls=create_expectation_model(
                 expectation, defn.action.replace(".", "__")
@@ -199,7 +205,7 @@ class Repository:
             args_docs={
                 key: schema.description or "-" for key, schema in expectation.items()
             },
-            rtype=Any,
+            rtype=Any,  # type: ignore
             rtype_adapter=TypeAdapter(Any),
             default_title=defn.title,
             display_group=defn.display_group,
@@ -207,11 +213,6 @@ class Repository:
             template_action=template_action,
             origin=origin,
         )
-
-    def _reset(self) -> None:
-        logger.warning("Resetting registry")
-        self._store = {}
-        self._is_initialized = False
 
     def _load_base_udfs(self) -> None:
         """Load all udfs and template actions into the registry."""
@@ -232,58 +233,180 @@ class Repository:
 
         elif self._origin == CUSTOM_REPOSITORY_ORIGIN:
             raise RegistryError("You cannot sync this repository.")
+        # Handle local git repositories
+        elif self._origin == DEFAULT_LOCAL_REGISTRY_ORIGIN:
+            # The local repo doesn't have to be a git repo, but it should be a directory
+            if not config.TRACECAT__LOCAL_REPOSITORY_ENABLED:
+                raise RegistryError(
+                    "Local repository is not enabled on this instance. "
+                    "Please set TRACECAT__LOCAL_REPOSITORY_ENABLED=true "
+                    "and ensure TRACECAT__LOCAL_REPOSITORY_PATH points to a valid Python package."
+                )
+            repo_path = Path(config.TRACECAT__LOCAL_REPOSITORY_CONTAINER_PATH)
 
-        # Load from remote
-        logger.info("Loading UDFs from origin", origin=self._origin)
+            if not repo_path.exists():
+                raise RegistryError(f"Local git repository not found: {repo_path}")
 
-        try:
-            org, repo_name, branch = parse_github_url(self._origin)
-        except ValueError as e:
-            raise RegistryError(
-                "Invalid GitHub URL. Please provide a valid Github SSH URL (git+ssh)."
-            ) from e
-        logger.debug(
-            "Parsed GitHub URL", org=org, package_name=repo_name, branch=branch
-        )
+            # Check that there's either pyproject.toml or setup.py
+            if not repo_path.joinpath("pyproject.toml").exists():
+                # expand the path to the host path
+                if host_path := config.TRACECAT__LOCAL_REPOSITORY_PATH:
+                    host_path = Path(host_path).expanduser()
+                    logger.debug("Host path", host_path=host_path)
+                raise RegistryError(
+                    "Local repository does not contain pyproject.toml. "
+                    "Please ensure TRACECAT__LOCAL_REPOSITORY_PATH points to a valid Python package."
+                    f"Host path: {host_path}"
+                )
 
-        package_name = config.TRACECAT__REMOTE_REPOSITORY_PACKAGE_NAME or repo_name
+            dot_git = repo_path.joinpath(".git")
+            package_name = repo_path.name
+            if dot_git.exists():
+                # Use the repository directory name as the package name
+                logger.debug(
+                    "Using local git repository",
+                    repo_path=str(repo_path),
+                    package_name=package_name,
+                )
 
-        cleaned_url = self.safe_remote_url(self._origin)
-        logger.debug("Cleaned URL", url=cleaned_url)
-        commit_sha = await self._install_remote_repository(cleaned_url, commit_sha)
-        module = await self._load_remote_repository(cleaned_url, package_name)
-        logger.info(
-            "Imported and reloaded remote repository",
-            module_name=module.__name__,
-            package_name=package_name,
-        )
-        return commit_sha
+                # Install the local repository in editable mode
+                env = {"GIT_DIR": dot_git.as_posix()}
+                if commit_sha is None:
+                    # Get the current commit SHA
+                    process = await asyncio.create_subprocess_exec(
+                        "git",
+                        "rev-parse",
+                        "HEAD",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                        cwd=repo_path.as_posix(),
+                    )
+                    stdout, _ = await process.communicate()
+                    if process.returncode != 0:
+                        raise RegistryError("Failed to get current commit SHA")
+                    commit_sha = stdout.decode().strip()
+            else:
+                logger.info(
+                    "Local repository is not a git repository, skipping commit SHA"
+                )
+
+            # Install the package in editable mode
+            extra_args = []
+            if config.TRACECAT__APP_ENV == "production":
+                # We set PYTHONUSERBASE in the prod Dockerfile
+                # Otherwise default to the user's home dir at ~/.local
+                python_user_base = (
+                    os.getenv("PYTHONUSERBASE")
+                    or Path.home().joinpath(".local").as_posix()
+                )
+                logger.debug(
+                    "Installing to PYTHONUSERBASE", python_user_base=python_user_base
+                )
+                extra_args = ["--target", python_user_base]
+
+            cmd = ["uv", "pip", "install", "--system", "--refresh", "--editable"]
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                repo_path.as_posix(),
+                *extra_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+            if process.returncode != 0:
+                error_message = stderr.decode().strip()
+                raise RegistryError(
+                    f"Failed to install local repository: {error_message}"
+                )
+
+            # Load the repository module
+            logger.warning("Loading local repository", repo_path=repo_path.as_posix())
+            module = await self._load_repository(repo_path.as_posix(), package_name)
+            logger.info(
+                "Imported and reloaded local repository",
+                module_name=module.__name__,
+                package_name=package_name,
+                commit_sha=commit_sha,
+            )
+            return None
+        elif self._origin.startswith("git+ssh://"):
+            # Load from remote
+            logger.info("Loading UDFs from origin", origin=self._origin)
+            allowed_domains = cast(
+                set[str],
+                await get_setting(
+                    "git_allowed_domains",
+                    role=self.role,
+                    # TODO: Deprecate in future version
+                    default=config.TRACECAT__ALLOWED_GIT_DOMAINS,
+                )
+                or {"github.com"},
+            )
+
+            cleaned_url = safe_url(self._origin)
+            try:
+                git_url = parse_git_url(cleaned_url, allowed_domains=allowed_domains)
+                host = git_url.host
+                org = git_url.org
+                repo_name = git_url.repo
+            except ValueError as e:
+                raise RegistryError(
+                    "Invalid Git repository URL. Please provide a valid Git SSH URL (git+ssh)."
+                ) from e
+            package_name = (
+                await get_setting(
+                    "git_repo_package_name",
+                    role=self.role,
+                    # TODO: Deprecate in future version
+                    default=config.TRACECAT__REMOTE_REPOSITORY_PACKAGE_NAME,
+                )
+                or repo_name
+            )
+            logger.debug(
+                "Parsed Git repository URL",
+                host=host,
+                org=org,
+                repo=repo_name,
+                package_name=package_name,
+            )
+
+            logger.debug("Git URL", git_url=git_url)
+            commit_sha = await self._install_remote_repository(
+                git_url=git_url, commit_sha=commit_sha
+            )
+            module = await self._load_repository(cleaned_url, package_name)
+            logger.info(
+                "Imported and reloaded remote repository",
+                module_name=module.__name__,
+                package_name=package_name,
+                commit_sha=commit_sha,
+            )
+            return commit_sha
+        else:
+            raise RegistryError(f"Unsupported origin: {self._origin}.")
 
     async def _install_remote_repository(
-        self, repo_url: str, commit_sha: str | None = None
+        self, git_url: GitUrl, commit_sha: str | None = None
     ) -> str:
         """Install the remote repository into the filesystem and return the commit sha."""
 
-        logger.info("Getting SSH key", role=self.role)
-        async with SecretsService.with_session(role=self.role) as service:
-            secret = await service.get_ssh_key(GITHUB_SSH_KEY_SECRET_NAME)
-
-        async with temporary_ssh_agent() as env:
-            logger.info("Entered temporary SSH agent context")
-            await add_ssh_key_to_agent(secret.reveal().value, env=env)
-            await add_host_to_known_hosts("github.com", env=env)
+        url = git_url.to_url()
+        async with (
+            get_async_session_context_manager() as session,
+            ssh_context(role=self.role, git_url=git_url, session=session) as env,
+        ):
+            if env is None:
+                raise RegistryError("No SSH key found")
             if commit_sha is None:
-                commit_sha = await get_git_repository_sha(repo_url, env=env)
-            await install_remote_repository(repo_url, commit_sha=commit_sha, env=env)
+                commit_sha = await get_git_repository_sha(url, env=env)
+            await install_remote_repository(url, commit_sha=commit_sha, env=env)
         return commit_sha
 
-    async def _load_remote_repository(
-        self, repo_url: str, module_name: str
-    ) -> ModuleType:
-        """Load remote repository module into memory.
-
+    async def _load_repository(self, repo_url: str, module_name: str) -> ModuleType:
+        """Load repository module into memory.
         Args:
-            repo_url (str): The URL of the remote git repository
+            repo_url (str): The URL of the repository
             module_name (str): The name of the Python module to import
 
         Returns:
@@ -293,26 +416,34 @@ class Repository:
             ImportError: If there is an error importing the module
         """
         try:
-            logger.info("Importing remote repository module", module_name=module_name)
+            logger.info("Importing repository module", module_name=module_name)
             # We only need to call this at the root level because
             # this deletes all the submodules as well
-            module = import_and_reload(module_name)
+            pkg_or_mod = import_and_reload(module_name)
 
-            # # Reload the module to ensure fresh execution
-            self._register_udfs_from_package(module, origin=repo_url)
-            logger.trace("AFTER", keys=self.keys)
+            # Reload the module to ensure fresh execution
+            logger.info("Registering UDFs from package", module_name=pkg_or_mod)
+            self._register_udfs_from_package(pkg_or_mod, origin=repo_url)
         except ImportError as e:
-            logger.error("Error importing remote repository udfs", error=e)
+            logger.error(
+                "Error importing repository udfs",
+                error=e,
+                module_name=module_name,
+                origin=repo_url,
+            )
             raise
 
         try:
-            self.load_template_actions_from_package(
-                package_name=module_name, origin=repo_url
-            )
+            self.load_template_actions_from_package(pkg_or_mod, origin=repo_url)
         except Exception as e:
-            logger.error("Error importing remote repository template actions", error=e)
+            logger.error(
+                "Error importing repository template actions",
+                error=e,
+                module_name=module_name,
+                origin=repo_url,
+            )
             raise
-        return module
+        return pkg_or_mod
 
     def _register_udf_from_function(
         self,
@@ -340,6 +471,9 @@ class Repository:
             name=name,
             namespace=validated_kwargs.namespace,
             description=validated_kwargs.description,
+            doc_url=validated_kwargs.doc_url,
+            author=validated_kwargs.author,
+            deprecated=validated_kwargs.deprecated,
             secrets=validated_kwargs.secrets,
             default_title=validated_kwargs.default_title,
             display_group=validated_kwargs.display_group,
@@ -406,17 +540,17 @@ class Repository:
     def _load_base_template_actions(self) -> None:
         """Load template actions from the actions/templates directory."""
 
-        return self.load_template_actions_from_package(
-            package_name=DEFAULT_REGISTRY_ORIGIN, origin=DEFAULT_REGISTRY_ORIGIN
-        )
+        module = import_and_reload(DEFAULT_REGISTRY_ORIGIN)
+        self.load_template_actions_from_package(module, origin=DEFAULT_REGISTRY_ORIGIN)
 
     def load_template_actions_from_package(
-        self, *, package_name: str, origin: str
+        self, module: ModuleType, origin: str
     ) -> None:
         """Load template actions from a package."""
         start_time = default_timer()
-        pkg_root = importlib.resources.files(package_name)
-        pkg_path = Path(pkg_root)
+        base_path = module.__path__[0]
+        base_package = module.__name__
+        pkg_path = Path(base_path)
         n_loaded = self.load_template_actions_from_path(path=pkg_path, origin=origin)
         time_elapsed = default_timer() - start_time
         if n_loaded > 0:
@@ -424,11 +558,11 @@ class Repository:
                 f"✅ Registered {n_loaded} template actions in {time_elapsed:.2f}s",
                 num_templates=n_loaded,
                 time_elapsed=time_elapsed,
-                package_name=package_name,
+                package_name=base_package,
             )
         else:
             logger.info(
-                "No template actions found in package", package_name=package_name
+                "No template actions found in package", package_name=base_package
             )
 
     def load_template_actions_from_path(self, *, path: Path, origin: str) -> int:
@@ -470,16 +604,7 @@ class Repository:
 
 
 def import_and_reload(module_name: str) -> ModuleType:
-    """Import and reload a module.
-
-    Steps
-    -----
-    1. Remove the module from sys.modules
-    2. Import the module
-    3. Reload the module
-    4. Add the module to sys.modules
-    5. Return the reloaded module
-    """
+    """Import and reload a module."""
     sys.modules.pop(module_name, None)
     module = importlib.import_module(module_name)
     reloaded_module = importlib.reload(module)
@@ -568,7 +693,7 @@ def _enforce_restrictions(fn: F) -> F:
     Returns
     -------
     F
-        The original function if no access to os.environ, os.getenv, or import os is found.
+        The original function if no access to os.environ, os.getenv, or imports os is found.
 
     Raises
     ------
@@ -589,55 +714,16 @@ def _enforce_restrictions(fn: F) -> F:
     # Check for direct access to os.environ
     if "os" in names and "environ" in names:
         raise ValueError(
-            "`os.environ` usage is not allowed in user-defined code."
-            f" Found in: {path}"
+            f"`os.environ` usage is not allowed in user-defined code. Found in: {path}"
         )
 
     # Check for invocations of os.getenv
     if "os" in names and "getenv" in names:
         raise ValueError(
-            "`os.getenv()` usage is not allowed in user-defined code."
-            f" Found in: {path}"
+            f"`os.getenv()` usage is not allowed in user-defined code. Found in: {path}"
         )
 
     return fn
-
-
-def safe_url(url: str) -> str:
-    """Remove credentials from a url."""
-    url_obj = urlparse(url)
-    # XXX(safety): Reconstruct url without credentials.
-    # Note that we do not recommend passing credentials in the url.
-    cleaned_url = urlunparse((url_obj.scheme, url_obj.netloc, url_obj.path, "", "", ""))
-    return cleaned_url
-
-
-def parse_github_url(url: str) -> tuple[str, str, str]:
-    """
-    Parse a GitHub URL to extract organization, package name, and branch.
-    Handles both standard GitHub URLs and 'git+' prefixed URLs with optional '@' for branch specification.
-    Currently only supports git+ssh.
-
-    Args:
-        url (str): The GitHub URL to parse.
-
-    Returns:
-        tuple[str, str, str]: A tuple containing (organization, package_name, branch).
-
-    Raises:
-        ValueError: If the URL is not a valid GitHub repository URL.
-    """
-    # Define regex patterns with atomic groups and no nested quantifiers
-    ssh_pattern = r"^git\+ssh://git@github\.com/(?P<org>[^/]+)/(?P<repo>[^/@]+?)(?:\.git)?(?:@(?P<branch>[^/]+))?$"
-
-    # Try matching SSH pattern
-    if ssh_match := re.match(ssh_pattern, url):
-        org = ssh_match.group("org")
-        repo = ssh_match.group("repo")
-        branch = ssh_match.group("branch") or "main"
-        return org, repo, branch
-
-    raise ValueError(f"Unsupported URL format: {url}")
 
 
 async def ensure_base_repository(
@@ -654,134 +740,6 @@ async def ensure_base_repository(
         logger.info("Created base registry repository", origin=origin)
     else:
         logger.info("Base registry repository already exists", origin=origin)
-
-
-class SshEnv(TypedDict):
-    SSH_AUTH_SOCK: str
-    SSH_AGENT_PID: str
-
-
-@asynccontextmanager
-async def temporary_ssh_agent() -> AsyncIterator[SshEnv]:
-    """Set up a temporary SSH agent and yield the SSH_AUTH_SOCK."""
-    original_ssh_auth_sock = os.environ.get("SSH_AUTH_SOCK")
-    try:
-        # Start ssh-agent
-        logger.debug("Starting ssh-agent")
-        try:
-            # We're using asyncio.to_thread to run the ssh-agent in a separate thread
-            # because for some reason, asyncio.create_subprocess_exec stalls and times out
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["ssh-agent", "-s"],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=10.0,
-            )
-            stdout = result.stdout
-            stderr = result.stderr
-            logger.debug("Started ssh-agent process", stdout=stdout, stderr=stderr)
-        except subprocess.TimeoutExpired as e:
-            logger.error("SSH-agent execution timed out")
-            raise RuntimeError("SSH-agent execution timed out") from e
-        except subprocess.CalledProcessError as e:
-            logger.error("Failed to start ssh-agent", stderr=e.stderr)
-            raise RuntimeError("Failed to start ssh-agent") from e
-
-        ssh_auth_sock = stdout.split("SSH_AUTH_SOCK=")[1].split(";")[0]
-        ssh_agent_pid = stdout.split("SSH_AGENT_PID=")[1].split(";")[0]
-
-        logger.debug(
-            "Started ssh-agent",
-            SSH_AUTH_SOCK=ssh_auth_sock,
-            SSH_AGENT_PID=ssh_agent_pid,
-        )
-        yield SshEnv(
-            SSH_AUTH_SOCK=ssh_auth_sock,
-            SSH_AGENT_PID=ssh_agent_pid,
-        )
-    finally:
-        if "SSH_AGENT_PID" in os.environ:
-            logger.debug("Killing ssh-agent")
-            await asyncio.create_subprocess_exec("ssh-agent", "-k")
-
-        # Restore original SSH_AUTH_SOCK if it existed
-        if original_ssh_auth_sock is not None:
-            logger.debug(
-                "Restoring original SSH_AUTH_SOCK", SSH_AUTH_SOCK=original_ssh_auth_sock
-            )
-            os.environ["SSH_AUTH_SOCK"] = original_ssh_auth_sock
-        else:
-            os.environ.pop("SSH_AUTH_SOCK", None)
-        logger.debug("Killed ssh-agent")
-
-
-async def add_ssh_key_to_agent(key_data: str, env: SshEnv) -> None:
-    """Add the SSH key to the agent then remove it."""
-    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_key_file:
-        temp_key_file.write(key_data)
-        temp_key_file.write("\n")
-        temp_key_file.flush()
-        logger.debug("Added SSH key to temp file", key_file=temp_key_file.name)
-        os.chmod(temp_key_file.name, 0o600)
-
-        try:
-            # Validate the key using paramiko
-            paramiko.Ed25519Key.from_private_key_file(temp_key_file.name)
-        except paramiko.SSHException as e:
-            logger.error(f"Invalid SSH key: {str(e)}")
-            raise
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "ssh-add",
-                temp_key_file.name,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=cast(Mapping[str, str], env),
-            )
-            _, stderr = await process.communicate()
-
-            if process.returncode != 0:
-                raise Exception(f"Failed to add SSH key: {stderr.decode().strip()}")
-
-            logger.info("Added SSH key to agent")
-        except Exception as e:
-            logger.error("Error adding SSH key", error=e)
-            raise
-
-
-async def add_host_to_known_hosts(url: str, *, env: SshEnv) -> None:
-    """Add the host to the known hosts file."""
-    try:
-        # Ensure the ~/.ssh directory exists
-        ssh_dir = Path.home() / ".ssh"
-        ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-        known_hosts_file = ssh_dir / "known_hosts"
-
-        # Use ssh-keyscan to get the host key
-        process = await asyncio.create_subprocess_exec(
-            "ssh-keyscan",
-            url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=cast(Mapping[str, str], env),
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            raise Exception(f"Failed to get host key: {stderr.decode().strip()}")
-
-        # Append the host key to the known_hosts file
-        with known_hosts_file.open("a") as f:
-            f.write(stdout.decode())
-
-        logger.info("Added host to known hosts", url=url)
-    except Exception as e:
-        logger.error(f"Error adding host to known hosts: {str(e)}")
-        raise
 
 
 async def install_remote_repository(
@@ -806,7 +764,7 @@ async def install_remote_repository(
             f"{repo_url}@{commit_sha}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=cast(Mapping[str, str], os.environ.copy() | env),
+            env=os.environ.copy() | env.to_dict(),
         )
         _, stderr = await process.communicate()
         if process.returncode != 0:
@@ -818,31 +776,3 @@ async def install_remote_repository(
     except Exception as e:
         logger.error(f"Error while fetching repository: {str(e)}")
         raise RuntimeError(f"Error while fetching repository: {str(e)}") from e
-
-
-async def get_git_repository_sha(repo_url: str, env: SshEnv) -> str:
-    """Get the SHA of the HEAD commit of a Git repository."""
-    try:
-        # Use git ls-remote to get the HEAD SHA without cloning
-        process = await asyncio.create_subprocess_exec(
-            "git",
-            "ls-remote",
-            repo_url,
-            "HEAD",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,  # type: ignore
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            error_message = stderr.decode().strip()
-            raise RuntimeError(f"Failed to get repository SHA: {error_message}")
-
-        # The output format is: "<SHA>\tHEAD"
-        sha = stdout.decode().split()[0]
-        return sha
-
-    except Exception as e:
-        logger.error("Error getting repository SHA", error=str(e))
-        raise RuntimeError(f"Error getting repository SHA: {str(e)}") from e

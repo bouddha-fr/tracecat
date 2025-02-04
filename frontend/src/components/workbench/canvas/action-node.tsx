@@ -10,6 +10,7 @@ import {
   Trash2Icon,
 } from "lucide-react"
 import { Node, NodeProps, useEdges } from "reactflow"
+import YAML from "yaml"
 
 import { useAction, useWorkflowManager } from "@/lib/hooks"
 import { cn, isEmptyObjectOrNullish, slugify } from "@/lib/utils"
@@ -91,11 +92,12 @@ export default React.memo(function ActionNode({
   const edges = useEdges()
   const incomingEdges = edges.filter((edge) => edge.target === id)
   const isChildWorkflow = action?.type === CHILD_WORKFLOW_ACTION_TYPE
-  const childWorkflowId = action?.inputs?.workflow_id
-    ? String(action?.inputs?.workflow_id)
+  const actionInputsObj = action?.inputs ? YAML.parse(action?.inputs) : {}
+  const childWorkflowId = actionInputsObj?.workflow_id
+    ? String(actionInputsObj?.workflow_id)
     : undefined
-  const childWorkflowAlias = action?.inputs?.workflow_alias
-    ? String(action?.inputs?.workflow_alias)
+  const childWorkflowAlias = actionInputsObj?.workflow_alias
+    ? String(actionInputsObj?.workflow_alias)
     : undefined
 
   // Create a skeleton loading state within the card frame
@@ -153,7 +155,7 @@ export default React.memo(function ActionNode({
                 <CardTitle className="flex w-full items-center space-x-2 text-xs font-medium leading-none">
                   <span>{action.title}</span>
                   <CopyButton
-                    value={`\$\{\{ ACTIONS.${slugify(action.title)}.result \}\}`}
+                    value={`ACTIONS.${slugify(action.title)}.result`}
                     toastMessage="Copied action reference to clipboard"
                     tooltipMessage="Copy action reference"
                   />
@@ -227,13 +229,22 @@ function ChildWorkflowLink({
   childWorkflowAlias?: string
 }) {
   const { workflows } = useWorkflowManager()
+  const { setSelectedNodeId } = useWorkflowBuilder()
   const childIdFromAlias = workflows?.find(
     (w) => w.alias === childWorkflowAlias
   )?.id
+
+  const handleClearSelection = () => {
+    setSelectedNodeId(null)
+  }
+
   const inner = () => {
     if (childWorkflowId) {
       return (
-        <Link href={`/workspaces/${workspaceId}/workflows/${childWorkflowId}`}>
+        <Link
+          href={`/workspaces/${workspaceId}/workflows/${childWorkflowId}`}
+          onClick={handleClearSelection}
+        >
           <div className="flex items-center gap-1">
             <span className="font-normal">Open workflow</span>
             <SquareArrowOutUpRightIcon className="size-3" />
@@ -254,6 +265,7 @@ function ChildWorkflowLink({
         <div className="flex items-center gap-1">
           <Link
             href={`/workspaces/${workspaceId}/workflows/${childIdFromAlias}`}
+            onClick={handleClearSelection}
           >
             <div className="flex items-center gap-1">
               <span className="font-mono font-normal tracking-tighter text-foreground/80">

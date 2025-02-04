@@ -2,7 +2,7 @@ import os
 import uuid
 from typing import Literal
 
-from tracecat.auth.constants import AuthType
+from tracecat.auth.enums import AuthType
 
 # === Internal Services === #
 TRACECAT__APP_ENV: Literal["development", "staging", "production"] = os.environ.get(
@@ -60,10 +60,14 @@ TRACECAT__DB_ENDPOINT = os.environ.get("TRACECAT__DB_ENDPOINT")
 TRACECAT__DB_PORT = os.environ.get("TRACECAT__DB_PORT")
 
 # === Auth config === #
+# Infrastructure config
 TRACECAT__AUTH_TYPES = {
     AuthType(t.lower())
     for t in os.environ.get("TRACECAT__AUTH_TYPES", "basic,google_oauth").split(",")
 }
+"""The set of allowed auth types on the platform. If an auth type is not in this set,
+it cannot be enabled."""
+
 TRACECAT__AUTH_REQUIRE_EMAIL_VERIFICATION = os.environ.get(
     "TRACECAT__AUTH_REQUIRE_EMAIL_VERIFICATION", ""
 ).lower() in ("true", "1")  # Default to False
@@ -74,6 +78,8 @@ TRACECAT__AUTH_ALLOWED_DOMAINS = set(
     ((domains := os.getenv("TRACECAT__AUTH_ALLOWED_DOMAINS")) and domains.split(","))
     or []
 )
+"""Deprecated: This config has been moved into the settings service"""
+
 TRACECAT__AUTH_MIN_PASSWORD_LENGTH = int(
     os.environ.get("TRACECAT__AUTH_MIN_PASSWORD_LENGTH") or 12
 )
@@ -92,11 +98,12 @@ OAUTH_CLIENT_SECRET = (
 USER_AUTH_SECRET = os.environ.get("USER_AUTH_SECRET", "")
 
 # SAML SSO
-SAML_IDP_CERTIFICATE = os.environ.get("SAML_IDP_CERTIFICATE")
+
+SAML_PUBLIC_ACS_URL = f"{TRACECAT__PUBLIC_APP_URL}/auth/saml/acs"
+
 SAML_IDP_METADATA_URL = os.environ.get("SAML_IDP_METADATA_URL")
-SAML_SP_ACS_URL = os.environ.get(
-    "SAML_SP_ACS_URL", "http://localhost/api/auth/saml/acs"
-)
+"""Deprecated: This config has been moved into the settings service"""
+
 XMLSEC_BINARY_PATH = os.environ.get("XMLSEC_BINARY_PATH", "/usr/bin/xmlsec1")
 
 # === CORS config === #
@@ -116,6 +123,7 @@ TEMPORAL__CLUSTER_QUEUE = os.environ.get(
     "TEMPORAL__CLUSTER_QUEUE", "tracecat-task-queue"
 )
 TEMPORAL__API_KEY__ARN = os.environ.get("TEMPORAL__API_KEY__ARN")
+TEMPORAL__API_KEY = os.environ.get("TEMPORAL__API_KEY")
 TEMPORAL__MTLS_ENABLED = os.environ.get("TEMPORAL__MTLS_ENABLED", "").lower() in (
     "1",
     "true",
@@ -141,19 +149,40 @@ TRACECAT__UNSAFE_DISABLE_SM_MASKING = os.environ.get(
 TRACECAT__SERVICE_KEY = os.environ.get("TRACECAT__SERVICE_KEY")
 
 # === Remote registry === #
+TRACECAT__ALLOWED_GIT_DOMAINS = set(
+    os.environ.get(
+        "TRACECAT__ALLOWED_GIT_DOMAINS", "github.com,gitlab.com,bitbucket.org"
+    ).split(",")
+)
+"""Deprecated: This config has been moved into the settings service"""
 # If you wish to use a remote registry, set the URL here
 # If the url is unset, this will be set to None
 TRACECAT__REMOTE_REPOSITORY_URL = (
     os.environ.get("TRACECAT__REMOTE_REPOSITORY_URL") or None
 )
+"""Deprecated: This config has been moved into the settings service"""
 TRACECAT__REMOTE_REPOSITORY_PACKAGE_NAME = os.getenv(
     "TRACECAT__REMOTE_REPOSITORY_PACKAGE_NAME"
 )
-"""If not provided, the package name will be inferred from the git remote URL."""
+"""If not provided, the package name will be inferred from the git remote URL.
 
+Deprecated: This config has been moved into the settings service
+"""
+
+# === Email settings === #
+TRACECAT__ALLOWED_EMAIL_ATTRIBUTES = os.environ.get(
+    "TRACECAT__ALLOWED_EMAIL_ATTRIBUTES"
+)
 # === AI settings === #
 TRACECAT__PRELOAD_OSS_MODELS = (
     (models := os.getenv("TRACECAT__PRELOAD_OSS_MODELS")) and models.split(",")
 ) or []
 
 OLLAMA__API_URL = os.environ.get("OLLAMA__API_URL", "http://ollama:11434")
+
+# === Local registry === #
+TRACECAT__LOCAL_REPOSITORY_ENABLED = os.getenv(
+    "TRACECAT__LOCAL_REPOSITORY_ENABLED", "0"
+).lower() in ("1", "true")
+TRACECAT__LOCAL_REPOSITORY_PATH = os.getenv("TRACECAT__LOCAL_REPOSITORY_PATH")
+TRACECAT__LOCAL_REPOSITORY_CONTAINER_PATH = "/app/local_registry"

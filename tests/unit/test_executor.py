@@ -6,16 +6,16 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from tracecat.contexts import RunContext
 from tracecat.dsl.common import create_default_execution_context
-from tracecat.dsl.models import ActionStatement, RunActionInput
+from tracecat.dsl.models import ActionStatement, RunActionInput, RunContext
+from tracecat.executor.models import ExecutorActionErrorInfo
 from tracecat.executor.service import run_action_from_input, sync_executor_entrypoint
 from tracecat.expressions.expectations import ExpectedField
+from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.logger import logger
 from tracecat.registry.actions.models import (
     ActionStep,
     RegistryActionCreate,
-    RegistryActionErrorInfo,
     TemplateAction,
     TemplateActionDefinition,
 )
@@ -33,7 +33,7 @@ def mock_run_context():
     wf_exec_id = f"{wf_id}:{exec_id}"
     run_id = uuid.uuid4()
     return RunContext(
-        wf_id=wf_id,
+        wf_id=WorkflowUUID.from_legacy(wf_id),
         wf_exec_id=wf_exec_id,
         wf_run_id=run_id,
         environment="default",
@@ -131,8 +131,8 @@ async def test_executor_can_run_udf_with_secrets(
         # Assert
         assert result == "__SECRET_VALUE_UDF__"
     finally:
-        secret = await sec_service.get_secret_by_name("test", raise_on_error=True)
-        await sec_service.delete_secret_by_id(secret.id)
+        secret = await sec_service.get_secret_by_name("test")
+        await sec_service.delete_secret(secret)
 
 
 @pytest.mark.integration
@@ -234,8 +234,8 @@ async def test_executor_can_run_template_action_with_secret(
         # Assert
         assert result == "__SECRET_VALUE__"
     finally:
-        secret = await sec_service.get_secret_by_name("test", raise_on_error=True)
-        await sec_service.delete_secret_by_id(secret.id)
+        secret = await sec_service.get_secret_by_name("test")
+        await sec_service.delete_secret(secret)
 
 
 async def mock_action(input: Any, **kwargs):
@@ -297,7 +297,7 @@ def test_sync_executor_entrypoint_returns_wrapped_error(
 
     # Run the entrypoint and verify it returns a RegistryActionErrorInfo
     result = sync_executor_entrypoint(input, test_role)
-    assert isinstance(result, RegistryActionErrorInfo)
+    assert isinstance(result, ExecutorActionErrorInfo)
     assert result.type == "ValueError"
     assert result.message == "__EXPECTED_MESSAGE__"
     assert result.action_name == "test.error_action"

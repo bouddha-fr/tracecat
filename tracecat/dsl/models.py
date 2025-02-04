@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from tracecat.contexts import RunContext
 from tracecat.dsl.constants import DEFAULT_ACTION_TIMEOUT
 from tracecat.dsl.enums import JoinStrategy
 from tracecat.expressions.common import ExprContext
-from tracecat.expressions.validation import ExpressionStr, TemplateValidator
+from tracecat.expressions.validation import ExpressionStr
+from tracecat.identifiers import WorkflowExecutionID, WorkflowRunID
+from tracecat.identifiers.workflow import AnyWorkflowID, WorkflowUUID
 from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
 
 SLUG_PATTERN = r"^[a-z0-9_]+$"
@@ -33,7 +34,9 @@ class DSLNodeResult(TypedDict, total=False):
 
 
 @dataclass(frozen=True)
-class DSLTaskErrorInfo:
+class ActionErrorInfo:
+    """Contains information about an action error."""
+
     ref: str
     """The task reference."""
 
@@ -48,6 +51,10 @@ class DSLTaskErrorInfo:
 
     attempt: int = 1
     """The attempt number."""
+
+    def format(self, loc: str = "run_action") -> str:
+        locator = f"{self.expr_context}.{self.ref} -> {loc}"
+        return f"[{locator}] (Attempt {self.attempt})\n\n{self.message}"
 
 
 class ActionRetryPolicy(BaseModel):
@@ -88,20 +95,13 @@ class ActionStatement(BaseModel):
 
     """Control flow options"""
 
-    run_if: Annotated[
-        str | None,
-        Field(default=None, description="Condition to run the task"),
-        TemplateValidator(),
-    ]
-
-    for_each: Annotated[
-        str | list[str] | None,
-        Field(
-            default=None,
-            description="Iterate over a list of items and run the task for each item.",
-        ),
-        TemplateValidator(),
-    ]
+    run_if: ExpressionStr | None = Field(
+        default=None, description="Condition to run the task"
+    )
+    for_each: ExpressionStr | list[ExpressionStr] | None = Field(
+        default=None,
+        description="Iterate over a list of items and run the task for each item.",
+    )
     retry_policy: ActionRetryPolicy = Field(
         default_factory=ActionRetryPolicy, description="Retry policy for the action."
     )
@@ -168,6 +168,21 @@ class DSLEnvironment(TypedDict, total=False):
     """The registry version to use for the workflow."""
 
 
+class RunContext(BaseModel):
+    """This is the runtime context model for a workflow run. Passed into activities."""
+
+    wf_id: WorkflowUUID
+    wf_exec_id: WorkflowExecutionID
+    wf_run_id: WorkflowRunID
+    environment: str
+
+    @field_validator("wf_id", mode="before")
+    @classmethod
+    def validate_workflow_id(cls, v: AnyWorkflowID) -> WorkflowUUID:
+        """Convert any valid workflow ID format to WorkflowUUID."""
+        return WorkflowUUID.new(v)
+
+
 class RunActionInput(BaseModel):
     """This object contains all the information needed to execute an action."""
 
@@ -190,3 +205,9 @@ class DSLExecutionError(TypedDict, total=False):
 
     message: str
     """The message of the exception."""
+
+
+@dataclass(frozen=True)
+class TaskExceptionInfo:
+    exception: Exception
+    details: ActionErrorInfo | None = None

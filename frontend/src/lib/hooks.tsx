@@ -6,14 +6,20 @@ import {
   actionsUpdateAction,
   ActionUpdate,
   ApiError,
+  AuthSettingsRead,
   CreateWorkspaceParams,
-  EventHistoryResponse,
+  GitSettingsRead,
+  OAuthSettingsRead,
   organizationDeleteOrgMember,
   OrganizationDeleteOrgMemberData,
   organizationDeleteSession,
   OrganizationDeleteSessionData,
   organizationListOrgMembers,
   organizationListSessions,
+  organizationSecretsCreateOrgSecret,
+  organizationSecretsDeleteOrgSecretById,
+  organizationSecretsListOrgSecrets,
+  organizationSecretsUpdateOrgSecretById,
   organizationUpdateOrgMember,
   OrganizationUpdateOrgMemberData,
   OrgMemberRead,
@@ -29,11 +35,11 @@ import {
   registryRepositoriesDeleteRegistryRepository,
   RegistryRepositoriesDeleteRegistryRepositoryData,
   registryRepositoriesListRegistryRepositories,
-  registryRepositoriesSyncExecutorFromRegistryRepository,
-  RegistryRepositoriesSyncExecutorFromRegistryRepositoryData,
+  registryRepositoriesReloadRegistryRepositories,
   registryRepositoriesSyncRegistryRepository,
   RegistryRepositoriesSyncRegistryRepositoryData,
   RegistryRepositoryReadMinimal,
+  SAMLSettingsRead,
   Schedule,
   schedulesCreateSchedule,
   SchedulesCreateScheduleData,
@@ -50,6 +56,18 @@ import {
   secretsUpdateSecretById,
   SecretUpdate,
   SessionRead,
+  settingsGetAuthSettings,
+  settingsGetGitSettings,
+  settingsGetOauthSettings,
+  settingsGetSamlSettings,
+  settingsUpdateAuthSettings,
+  SettingsUpdateAuthSettingsData,
+  settingsUpdateGitSettings,
+  SettingsUpdateGitSettingsData,
+  settingsUpdateOauthSettings,
+  SettingsUpdateOauthSettingsData,
+  settingsUpdateSamlSettings,
+  SettingsUpdateSamlSettingsData,
   TagRead,
   tagsCreateTag,
   TagsCreateTagData,
@@ -62,8 +80,13 @@ import {
   UpsertWebhookParams,
   usersUsersPatchCurrentUser,
   UserUpdate,
-  WorkflowExecutionResponse,
-  workflowExecutionsListWorkflowExecutionEventHistory,
+  WorkflowExecutionCreate,
+  WorkflowExecutionRead,
+  WorkflowExecutionReadCompact,
+  WorkflowExecutionReadMinimal,
+  workflowExecutionsCreateWorkflowExecution,
+  workflowExecutionsGetWorkflowExecution,
+  workflowExecutionsGetWorkflowExecutionCompact,
   workflowExecutionsListWorkflowExecutions,
   WorkflowReadMinimal,
   workflowsAddTag,
@@ -83,8 +106,26 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import Cookies from "js-cookie"
 import { CircleCheck } from "lucide-react"
 
+import { getBaseUrl } from "@/lib/api"
 import { retryHandler, TracecatApiError } from "@/lib/errors"
 import { toast } from "@/components/ui/use-toast"
+
+export function useAppInfo() {
+  const { data: appInfo, isLoading: appInfoIsLoading } = useQuery<{
+    public_app_url: string
+    auth_allowed_types: string[]
+    auth_basic_enabled: boolean
+    oauth_google_enabled: boolean
+    saml_enabled: boolean
+  }>({
+    queryKey: ["app-info"],
+    queryFn: async () => {
+      const resp = await fetch(getBaseUrl() + "/info")
+      return await resp.json()
+    },
+  })
+  return { appInfo, appInfoIsLoading }
+}
 
 export function useLocalStorage<T>(
   key: string,
@@ -144,10 +185,6 @@ export function useAction(
     },
     onError: (error) => {
       console.error("Failed to update action:", error)
-      toast({
-        title: "Failed to save action",
-        description: "Could not update your action. Please try again.",
-      })
       setIsSaving(false)
     },
   })
@@ -415,6 +452,9 @@ export function useWorkspaceManager() {
 export function useWorkflowExecutions(
   workflowId: string,
   options?: {
+    /**
+     * Refetch interval in milliseconds
+     */
     refetchInterval?: number
   }
 ) {
@@ -423,7 +463,7 @@ export function useWorkflowExecutions(
     data: workflowExecutions,
     isLoading: workflowExecutionsIsLoading,
     error: workflowExecutionsError,
-  } = useQuery<WorkflowExecutionResponse[], Error>({
+  } = useQuery<WorkflowExecutionReadMinimal[], Error>({
     queryKey: ["workflow-executions", workflowId],
     queryFn: async () =>
       await workflowExecutionsListWorkflowExecutions({
@@ -439,24 +479,127 @@ export function useWorkflowExecutions(
   }
 }
 
-export function useWorkflowExecutionEventHistory(workflowExecutionId: string) {
+export function useWorkflowExecution(
+  executionId: string,
+  options?: {
+    refetchInterval?: number
+  }
+) {
   const { workspaceId } = useWorkspace()
   const {
-    data: eventHistory,
-    isLoading: eventHistoryLoading,
-    error: eventHistoryError,
-  } = useQuery<EventHistoryResponse[], Error>({
-    queryKey: ["workflow-executions", workflowExecutionId, "event-history"],
+    data: execution,
+    isLoading: executionIsLoading,
+    error: executionError,
+  } = useQuery<WorkflowExecutionRead, ApiError>({
+    queryKey: ["workflow-executions", executionId],
     queryFn: async () =>
-      await workflowExecutionsListWorkflowExecutionEventHistory({
+      await workflowExecutionsGetWorkflowExecution({
         workspaceId,
-        executionId: workflowExecutionId,
+        executionId: executionId,
       }),
+    retry: retryHandler,
+    ...options,
   })
   return {
-    eventHistory,
-    eventHistoryLoading,
-    eventHistoryError,
+    execution,
+    executionIsLoading,
+    executionError,
+  }
+}
+
+export function useCompactWorkflowExecution(workflowExecutionId?: string) {
+  // if execution ID contains non-url-safe characters, decode it
+  const { workspaceId } = useWorkspace()
+  const {
+    data: execution,
+    isLoading: executionIsLoading,
+    error: executionError,
+  } = useQuery<WorkflowExecutionReadCompact | null, ApiError>({
+    queryKey: ["compact-workflow-execution", workflowExecutionId],
+    queryFn: async () => {
+      if (!workflowExecutionId) return null
+      return await workflowExecutionsGetWorkflowExecutionCompact({
+        workspaceId,
+        executionId: encodeURIComponent(workflowExecutionId),
+      })
+    },
+    retry: retryHandler,
+    staleTime: 0,
+    refetchInterval(query) {
+      switch (query.state.data?.status) {
+        case "RUNNING":
+          return 1000
+        default:
+          return false
+      }
+    },
+  })
+  return {
+    execution,
+    executionIsLoading,
+    executionError,
+  }
+}
+
+export function useManualWorkflowExecution(
+  workflowId: string,
+  options?: {
+    refetchInterval?: number
+  }
+) {
+  const queryClient = useQueryClient()
+  const { workspaceId } = useWorkspace()
+
+  const { mutateAsync: createExecution, isPending: createExecutionIsPending } =
+    useMutation({
+      mutationFn: async (params: WorkflowExecutionCreate) => {
+        return await workflowExecutionsCreateWorkflowExecution({
+          workspaceId,
+          requestBody: params,
+        })
+      },
+      onSuccess: async () => {
+        // NOTE(daryl): This is a hack to ensure that the last execution is refetched
+        // and the UI is updated.
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        await queryClient.refetchQueries({
+          queryKey: ["last-manual-execution"],
+          type: "all",
+        })
+        await queryClient.refetchQueries({
+          queryKey: ["last-manual-execution"],
+          type: "all",
+        })
+      },
+    })
+
+  // Last execution
+  const {
+    data: lastExecution,
+    isLoading: lastExecutionIsLoading,
+    error: lastExecutionError,
+  } = useQuery<WorkflowExecutionReadMinimal | null, Error>({
+    queryKey: ["last-manual-execution", workflowId],
+    queryFn: async () => {
+      const executions = await workflowExecutionsListWorkflowExecutions({
+        workspaceId,
+        workflowId,
+        trigger: ["manual"],
+        limit: 1,
+        userId: "current",
+      })
+
+      return executions.length > 0 ? executions[0] : null
+    },
+    staleTime: 0,
+    ...options,
+  })
+  return {
+    lastExecution,
+    lastExecutionIsLoading,
+    lastExecutionError,
+    createExecution,
+    createExecutionIsPending,
   }
 }
 
@@ -563,7 +706,6 @@ export function useWorkspaceSecrets() {
     queryFn: async () =>
       await secretsListSecrets({
         workspaceId,
-        level: "workspace",
         type: ["custom"],
       }),
   })
@@ -672,8 +814,7 @@ export function useOrgSecrets() {
   } = useQuery<SecretReadMinimal[]>({
     queryKey: ["org-custom-secrets"],
     queryFn: async () =>
-      await secretsListSecrets({
-        level: "organization",
+      await organizationSecretsListOrgSecrets({
         type: ["custom"],
       }),
   })
@@ -686,8 +827,7 @@ export function useOrgSecrets() {
   } = useQuery<SecretReadMinimal[]>({
     queryKey: ["org-ssh-keys"],
     queryFn: async () =>
-      await secretsListSecrets({
-        level: "organization",
+      await organizationSecretsListOrgSecrets({
         type: ["ssh-key"],
       }),
   })
@@ -695,7 +835,7 @@ export function useOrgSecrets() {
   // create
   const { mutateAsync: createSecret } = useMutation({
     mutationFn: async (params: SecretCreate) =>
-      await secretsCreateSecret({ requestBody: params }),
+      await organizationSecretsCreateOrgSecret({ requestBody: params }),
     onSuccess: (_, variables) => {
       switch (variables.type) {
         case "ssh-key":
@@ -723,7 +863,11 @@ export function useOrgSecrets() {
     }: {
       secretId: string
       params: SecretUpdate
-    }) => await secretsUpdateSecretById({ secretId, requestBody: params }),
+    }) =>
+      await organizationSecretsUpdateOrgSecretById({
+        secretId,
+        requestBody: params,
+      }),
     onSuccess: (_, variables) => {
       switch (variables.params.type) {
         case "ssh-key":
@@ -746,7 +890,7 @@ export function useOrgSecrets() {
   // delete
   const { mutateAsync: deleteSecretById } = useMutation({
     mutationFn: async (secret: SecretReadMinimal) =>
-      await secretsDeleteSecretById({ secretId: secret.id }),
+      await organizationSecretsDeleteOrgSecretById({ secretId: secret.id }),
     onSuccess: (_, variables) => {
       switch (variables.type) {
         case "ssh-key":
@@ -1111,40 +1255,6 @@ export function useRegistryRepositories() {
     },
   })
 
-  const {
-    mutateAsync: syncExecutor,
-    isPending: syncExecutorIsPending,
-    error: syncExecutorError,
-  } = useMutation({
-    mutationFn: async (
-      params: RegistryRepositoriesSyncExecutorFromRegistryRepositoryData
-    ) => await registryRepositoriesSyncExecutorFromRegistryRepository(params),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["registry_repositories"] })
-      queryClient.invalidateQueries({ queryKey: ["registry_actions"] })
-      toast({
-        title: "Synced executor",
-        description: "Executor synced successfully.",
-      })
-    },
-    onError: (error: TracecatApiError) => {
-      const apiError = error as TracecatApiError
-      switch (apiError.status) {
-        case 403:
-          toast({
-            title: "You cannot perform this action",
-            description: `${apiError.message}: ${apiError.body.detail}`,
-          })
-          break
-        default:
-          toast({
-            title: "Failed to sync executor",
-            description: `An unexpected error occurred while syncing the executor. ${apiError.message}: ${apiError.body.detail}`,
-          })
-      }
-    },
-  })
-
   return {
     repos,
     reposIsLoading,
@@ -1155,9 +1265,6 @@ export function useRegistryRepositories() {
     deleteRepo,
     deleteRepoIsPending,
     deleteRepoError,
-    syncExecutor,
-    syncExecutorIsPending,
-    syncExecutorError,
   }
 }
 
@@ -1415,5 +1522,261 @@ export function useTags(workspaceId: string) {
     deleteTag,
     deleteTagIsPending,
     deleteTagError,
+  }
+}
+
+export function useOrgGitSettings() {
+  const queryClient = useQueryClient()
+  // Get Git settings
+  const {
+    data: gitSettings,
+    isLoading: gitSettingsIsLoading,
+    error: gitSettingsError,
+  } = useQuery<GitSettingsRead>({
+    queryKey: ["org-git-settings"],
+    queryFn: async () => await settingsGetGitSettings(),
+  })
+
+  // Update Git settings
+  const {
+    mutateAsync: updateGitSettings,
+    isPending: updateGitSettingsIsPending,
+    error: updateGitSettingsError,
+  } = useMutation({
+    mutationFn: async (params: SettingsUpdateGitSettingsData) =>
+      await settingsUpdateGitSettings(params),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["org-git-settings"] })
+      toast({
+        title: "Updated Git settings",
+        description: "Git settings updated successfully.",
+      })
+    },
+    onError: (error: TracecatApiError) => {
+      switch (error.status) {
+        case 403:
+          toast({
+            title: "Forbidden",
+            description: "You cannot perform this action",
+          })
+          break
+        default:
+          console.error("Failed to update Git settings", error)
+          toast({
+            title: "Failed to update Git settings",
+            description: `An error occurred while updating the Git settings: ${error.body.detail}`,
+          })
+      }
+    },
+  })
+
+  return {
+    // Get
+    gitSettings,
+    gitSettingsIsLoading,
+    gitSettingsError,
+    // Update
+    updateGitSettings,
+    updateGitSettingsIsPending,
+    updateGitSettingsError,
+  }
+}
+
+export function useOrgSamlSettings() {
+  const queryClient = useQueryClient()
+
+  // Get SAML settings
+  const {
+    data: samlSettings,
+    isLoading: samlSettingsIsLoading,
+    error: samlSettingsError,
+  } = useQuery<SAMLSettingsRead>({
+    queryKey: ["org-saml-settings"],
+    queryFn: async () => await settingsGetSamlSettings(),
+  })
+
+  // Update SAML settings
+  const {
+    mutateAsync: updateSamlSettings,
+    isPending: updateSamlSettingsIsPending,
+    error: updateSamlSettingsError,
+  } = useMutation({
+    mutationFn: async (params: SettingsUpdateSamlSettingsData) =>
+      await settingsUpdateSamlSettings(params),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["org-saml-settings"] })
+      toast({
+        title: "Updated SAML settings",
+        description: "SAML settings updated successfully.",
+      })
+    },
+    onError: (error: TracecatApiError) => {
+      switch (error.status) {
+        case 403:
+          toast({
+            title: "Forbidden",
+            description: "You cannot perform this action",
+          })
+          break
+        default:
+          console.error("Failed to update SAML settings", error)
+          toast({
+            title: "Failed to update SAML settings",
+            description: `An error occurred while updating the SAML settings: ${error.body.detail}`,
+          })
+      }
+    },
+  })
+
+  return {
+    // Get
+    samlSettings,
+    samlSettingsIsLoading,
+    samlSettingsError,
+    // Update
+    updateSamlSettings,
+    updateSamlSettingsIsPending,
+    updateSamlSettingsError,
+  }
+}
+
+export function useRegistryRepositoriesReload() {
+  const queryClient = useQueryClient()
+  const {
+    mutateAsync: reloadRegistryRepositories,
+    isPending: reloadRegistryRepositoriesIsPending,
+    error: reloadRegistryRepositoriesError,
+  } = useMutation({
+    mutationFn: async () =>
+      await registryRepositoriesReloadRegistryRepositories(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["registry_repositories"] })
+      toast({
+        title: "Reloaded repositories",
+        description: "Repositories reloaded successfully.",
+      })
+    },
+  })
+
+  return {
+    reloadRegistryRepositories,
+    reloadRegistryRepositoriesIsPending,
+    reloadRegistryRepositoriesError,
+  }
+}
+
+export function useOrgAuthSettings() {
+  const queryClient = useQueryClient()
+
+  // Get Auth settings
+  const {
+    data: authSettings,
+    isLoading: authSettingsIsLoading,
+    error: authSettingsError,
+  } = useQuery<AuthSettingsRead>({
+    queryKey: ["org-auth-settings"],
+    queryFn: async () => await settingsGetAuthSettings(),
+  })
+
+  // Update Auth settings
+  const {
+    mutateAsync: updateAuthSettings,
+    isPending: updateAuthSettingsIsPending,
+    error: updateAuthSettingsError,
+  } = useMutation({
+    mutationFn: async (params: SettingsUpdateAuthSettingsData) =>
+      await settingsUpdateAuthSettings(params),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["org-auth-settings"] })
+      toast({
+        title: "Updated Auth settings",
+        description: "Auth settings updated successfully.",
+      })
+    },
+    onError: (error: TracecatApiError) => {
+      switch (error.status) {
+        case 403:
+          toast({
+            title: "Forbidden",
+            description: "You cannot perform this action",
+          })
+          break
+        default:
+          console.error("Failed to update Auth settings", error)
+          toast({
+            title: "Failed to update Auth settings",
+            description: `An error occurred while updating the Auth settings: ${error.body.detail}`,
+          })
+      }
+    },
+  })
+
+  return {
+    // Get
+    authSettings,
+    authSettingsIsLoading,
+    authSettingsError,
+    // Update
+    updateAuthSettings,
+    updateAuthSettingsIsPending,
+    updateAuthSettingsError,
+  }
+}
+
+export function useOrgOAuthSettings() {
+  const queryClient = useQueryClient()
+
+  // Get OAuth settings
+  const {
+    data: oauthSettings,
+    isLoading: oauthSettingsIsLoading,
+    error: oauthSettingsError,
+  } = useQuery<OAuthSettingsRead>({
+    queryKey: ["org-oauth-settings"],
+    queryFn: async () => await settingsGetOauthSettings(),
+  })
+
+  // Update OAuth settings
+  const {
+    mutateAsync: updateOAuthSettings,
+    isPending: updateOAuthSettingsIsPending,
+    error: updateOAuthSettingsError,
+  } = useMutation({
+    mutationFn: async (params: SettingsUpdateOauthSettingsData) =>
+      await settingsUpdateOauthSettings(params),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["org-oauth-settings"] })
+      toast({
+        title: "Updated OAuth settings",
+        description: "OAuth settings updated successfully.",
+      })
+    },
+    onError: (error: TracecatApiError) => {
+      switch (error.status) {
+        case 403:
+          toast({
+            title: "Forbidden",
+            description: "You cannot perform this action",
+          })
+          break
+        default:
+          console.error("Failed to update OAuth settings", error)
+          toast({
+            title: "Failed to update OAuth settings",
+            description: `An error occurred while updating the OAuth settings: ${error.body.detail}`,
+          })
+      }
+    },
+  })
+
+  return {
+    // Get
+    oauthSettings,
+    oauthSettingsIsLoading,
+    oauthSettingsError,
+    // Update
+    updateOAuthSettings,
+    updateOAuthSettingsIsPending,
+    updateOAuthSettingsError,
   }
 }

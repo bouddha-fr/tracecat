@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     SecretStr,
     StringConstraints,
     field_validator,
@@ -15,21 +16,13 @@ from pydantic import (
 from tracecat.db.schemas import BaseSecret
 from tracecat.identifiers import OwnerID, SecretID
 from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
-from tracecat.secrets.enums import SecretLevel, SecretType
+from tracecat.secrets.enums import SecretType
 
 SecretName = Annotated[str, StringConstraints(pattern=r"[a-z0-9_]+")]
 """Validator for a secret name. e.g. 'aws_access_key_id'"""
 
 SecretKey = Annotated[str, StringConstraints(pattern=r"[a-zA-Z0-9_]+")]
 """Validator for a secret key. e.g. 'access_key_id'"""
-
-
-class RevealedSecretKeyValue(BaseModel):
-    key: str
-    value: str
-
-    def conceal(self) -> SecretKeyValue:
-        return SecretKeyValue(key=self.key, value=SecretStr(self.value))
 
 
 class SecretKeyValue(BaseModel):
@@ -40,9 +33,6 @@ class SecretKeyValue(BaseModel):
     def from_str(kv: str) -> SecretKeyValue:
         key, value = kv.split("=", 1)
         return SecretKeyValue(key=key, value=SecretStr(value))
-
-    def reveal(self) -> RevealedSecretKeyValue:
-        return RevealedSecretKeyValue(key=self.key, value=self.value.get_secret_value())
 
 
 class SecretBase(BaseModel):
@@ -87,9 +77,9 @@ class SecretCreate(BaseModel):
     - `oauth2`: OAuth2 Client Credentials (TBC)"""
 
     type: SecretType = SecretType.CUSTOM
-    name: str
-    description: str | None = None
-    keys: list[SecretKeyValue]
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str | None = Field(default=None, min_length=0, max_length=1000)
+    keys: list[SecretKeyValue] = Field(..., min_length=1, max_length=100)
     tags: dict[str, str] | None = None
     environment: str = DEFAULT_SECRETS_ENVIRONMENT
 
@@ -118,12 +108,13 @@ class SecretUpdate(BaseModel):
     - `oauth2`: OAuth2 Client Credentials (TBC)"""
 
     type: SecretType | None = None
-    name: str | None = None
-    description: str | None = None
-    keys: list[SecretKeyValue] | None = None
-    tags: dict[str, str] | None = None
-    environment: str | None = None
-    level: SecretLevel | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = Field(default=None, min_length=0, max_length=1000)
+    keys: list[SecretKeyValue] | None = Field(
+        default=None, min_length=1, max_length=100
+    )
+    tags: dict[str, str] | None = Field(default=None, min_length=0, max_length=1000)
+    environment: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class SecretSearch(BaseModel):
@@ -132,7 +123,6 @@ class SecretSearch(BaseModel):
     environment: str
     owner_ids: set[UUID] | None = None
     types: set[SecretType] | None = None
-    levels: set[SecretLevel] | None = None
 
 
 class SecretReadMinimal(BaseModel):

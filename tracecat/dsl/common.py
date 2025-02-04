@@ -8,6 +8,8 @@ from pathlib import Path
 from tempfile import SpooledTemporaryFile
 from typing import Any, Self, cast
 
+import orjson
+import temporalio.api.common.v1
 import yaml
 from pydantic import (
     BaseModel,
@@ -18,7 +20,6 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from tracecat.contexts import RunContext
 from tracecat.db.schemas import Action
 from tracecat.dsl.enums import EdgeType, FailStrategy, LoopStrategy
 from tracecat.dsl.models import (
@@ -27,6 +28,7 @@ from tracecat.dsl.models import (
     DSLEnvironment,
     DSLExecutionError,
     ExecutionContext,
+    RunContext,
     Trigger,
     TriggerInputs,
 )
@@ -34,7 +36,8 @@ from tracecat.dsl.view import RFEdge, RFGraph, RFNode, TriggerNode, UDFNode, UDF
 from tracecat.expressions import patterns
 from tracecat.expressions.common import ExprContext
 from tracecat.expressions.expectations import ExpectedField
-from tracecat.identifiers import ScheduleID, WorkflowID
+from tracecat.identifiers import ScheduleID
+from tracecat.identifiers.workflow import AnyWorkflowID, WorkflowUUID
 from tracecat.logger import logger
 from tracecat.parse import traverse_leaves
 from tracecat.types.auth import Role
@@ -45,7 +48,7 @@ from tracecat.workflow.actions.models import ActionControlFlow
 class DSLEntrypoint(BaseModel):
     ref: str | None = Field(default=None, description="The entrypoint action ref")
     expects: dict[str, ExpectedField] | None = Field(
-        None,
+        default=None,
         description=(
             "Expected trigger input schema. "
             "Use this to specify the expected shape of the trigger input."
@@ -78,6 +81,9 @@ class DSLInput(BaseModel):
     )
     returns: Any | None = Field(
         default=None, description="The action ref or value to return."
+    )
+    error_handler: str | None = Field(
+        default=None, description="The action ref to handle errors."
     )
 
     @model_validator(mode="after")
@@ -211,7 +217,7 @@ class DSLInput(BaseModel):
 class DSLRunArgs(BaseModel):
     role: Role
     dsl: DSLInput | None = None
-    wf_id: WorkflowID
+    wf_id: WorkflowUUID
     trigger_inputs: TriggerInputs | None = None
     parent_run_context: RunContext | None = None
     runtime_config: DSLConfig = Field(
@@ -230,11 +236,17 @@ class DSLRunArgs(BaseModel):
         description="The schedule ID that triggered this workflow, if any.",
     )
 
+    @field_validator("wf_id", mode="before")
+    @classmethod
+    def validate_workflow_id(cls, v: AnyWorkflowID) -> WorkflowUUID:
+        """Convert any valid workflow ID format to WorkflowUUID."""
+        return WorkflowUUID.new(v)
+
 
 class ExecuteChildWorkflowArgs(BaseModel):
-    workflow_id: WorkflowID | None = None
+    workflow_id: WorkflowUUID | None = None
     workflow_alias: str | None = None
-    trigger_inputs: TriggerInputs
+    trigger_inputs: TriggerInputs | None = None
     environment: str | None = None
     version: int | None = None
     loop_strategy: LoopStrategy = LoopStrategy.BATCH
@@ -256,6 +268,27 @@ class ExecuteChildWorkflowArgs(BaseModel):
                 },
             )
         return self
+
+    @field_validator("workflow_id", mode="before")
+    @classmethod
+    def validate_workflow_id(cls, v: AnyWorkflowID) -> WorkflowUUID:
+        """Convert any valid workflow ID format to WorkflowUUID."""
+        return WorkflowUUID.new(v)
+
+
+class ChildWorkflowMemo(BaseModel):
+    action_ref: str = Field(
+        ..., description="The action ref that initiated the child workflow."
+    )
+
+    @staticmethod
+    def from_temporal(memo: temporalio.api.common.v1.Memo) -> ChildWorkflowMemo:
+        try:
+            action_ref = orjson.loads(memo.fields["action_ref"].data)
+            return ChildWorkflowMemo(action_ref=action_ref)
+        except Exception as e:
+            logger.opt(exception=e).error("Error parsing child workflow memo")
+            raise e
 
 
 AdjDst = tuple[str, EdgeType]
@@ -313,11 +346,12 @@ def build_action_statements(
 
         action = id2action[node.id]
         control_flow = ActionControlFlow.model_validate(action.control_flow)
+        args = yaml.safe_load(action.inputs) or {}
         action_stmt = ActionStatement(
             id=action.id,
             ref=action.ref,
             action=action.type,
-            args=action.inputs,
+            args=args,
             depends_on=dependencies,
             run_if=control_flow.run_if,
             for_each=control_flow.for_each,
